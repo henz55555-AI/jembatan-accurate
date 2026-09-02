@@ -28,7 +28,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 DB_ID = os.environ.get("ACCURATE_DB_ID", "")
 ACC = "https://account.accurate.id"
-SCOPES = "item_view customer_view sales_invoice_view sales_order_view receipt_view warehouse_view"
+SCOPES = os.environ.get("ACCURATE_SCOPES", "item_view customer_view sales_invoice_view sales_order_view warehouse_view")
 TOK_FILE = "tokens.json"
 
 state = {"access": None, "refresh": os.environ.get("ACCURATE_REFRESH_TOKEN"), "exp": 0, "host": None, "session": None, "sess_exp": 0}
@@ -197,16 +197,33 @@ def auth():
 
 
 @app.get("/callback")
-async def callback(code: str, state_: str = None, state: str = None):
+async def callback(request: Request):
+    q = dict(request.query_params)
+    code = q.get("code")
+    if not code:
+        return HTMLResponse(
+            "<h3>❌ Accurate tidak mengirim kode izin.</h3>"
+            "<p>Ini biasanya karena URL OAuth Callback di aplikasi Accurate belum sama persis dengan alamat ini, "
+            "atau halaman /callback dibuka langsung tanpa lewat tombol Login.</p>"
+            f"<p>Yang dikirim Accurate: <code>{q or 'kosong'}</code></p>"
+            f"<p>Pastikan di account.accurate.id/developer, URL OAuth Callback = <code>{BASE_URL}/callback</code>, "
+            f"lalu ulangi dari <a href='/auth'>Login Accurate</a>.</p>", status_code=400)
     async with httpx.AsyncClient() as c:
-        r = await c.post(f"{ACC}/oauth/token", data={"grant_type": "authorization_code", "code": code, "redirect_uri": f"{BASE_URL}/callback"},
+        r = await c.post(f"{ACC}/oauth/token",
+                         data={"grant_type": "authorization_code", "code": code, "redirect_uri": f"{BASE_URL}/callback"},
                          auth=(CLIENT_ID, CLIENT_SECRET))
     if r.status_code != 200:
-        raise HTTPException(400, r.text)
+        return HTMLResponse(f"<h3>❌ Gagal tukar token</h3><p>Balasan Accurate:</p><pre>{r.text}</pre>"
+                            "<p>Cek ACCURATE_CLIENT_ID / ACCURATE_CLIENT_SECRET di Railway.</p>", status_code=400)
     d = r.json()
-    globals()["state"].update(access=d["access_token"], refresh=d["refresh_token"], exp=time.time() + d.get("expires_in", 3600) - 60)
+    state.update(access=d["access_token"], refresh=d["refresh_token"], exp=time.time() + d.get("expires_in", 3600) - 60)
     save()
-    return HTMLResponse(f"<h3>✅ Accurate tersambung.</h3><p>Simpan refresh token ini ke env <code>ACCURATE_REFRESH_TOKEN</code> supaya tahan restart:</p><textarea cols=80 rows=3>{d['refresh_token']}</textarea><p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude Connectors.</p>")
+    return HTMLResponse(
+        "<h3>✅ Accurate tersambung.</h3>"
+        "<p>Simpan refresh token ini ke Variables Railway sebagai <code>ACCURATE_REFRESH_TOKEN</code> "
+        "supaya tidak perlu login ulang saat server restart:</p>"
+        f"<textarea cols=80 rows=3>{d['refresh_token']}</textarea>"
+        f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
 
 
 @app.middleware("http")
