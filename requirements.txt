@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+httpx
+mcp>=1.9
