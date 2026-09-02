@@ -19,10 +19,11 @@ import os, json, time, secrets, urllib.parse
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
-from mcp.server.fastmcp import FastMCP
 
-CLIENT_ID = os.environ["ACCURATE_CLIENT_ID"]
-CLIENT_SECRET = os.environ["ACCURATE_CLIENT_SECRET"]
+CLIENT_ID = os.environ.get("ACCURATE_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("ACCURATE_CLIENT_SECRET", "")
+if not CLIENT_ID or not CLIENT_SECRET:
+    print("PERINGATAN: ACCURATE_CLIENT_ID / ACCURATE_CLIENT_SECRET belum diisi di Variables")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 DB_ID = os.environ.get("ACCURATE_DB_ID", "")
@@ -91,10 +92,24 @@ async def api(path: str, params: dict):
 
 
 # ---------- MCP tools ----------
-mcp = FastMCP("Accurate Jaya Partindo", stateless_http=True)
+TOOLS = {}
 
 
-@mcp.tool()
+def tool(schema):
+    """Daftarkan fungsi sebagai MCP tool (tanpa pustaka mcp, supaya tidak tergantung versi)."""
+    def deco(fn):
+        TOOLS[fn.__name__] = {"fn": fn, "description": fn.__doc__.strip(), "inputSchema": {"type": "object", "properties": schema, "required": [k for k, v in schema.items() if v.get("required")]}}
+        for v in schema.values():
+            v.pop("required", None)
+        return fn
+    return deco
+
+
+S = lambda d, req=False: {"type": "string", "description": d, "required": req}
+I = lambda d, req=False: {"type": "integer", "description": d, "required": req}
+
+
+@tool({"kata_kunci": S("nama/kode barang", True), "halaman": I("halaman, mulai 1")})
 async def cari_barang(kata_kunci: str, halaman: int = 1) -> str:
     """Cari barang/sparepart di Accurate berdasarkan nama atau kode. Mengembalikan kode, nama, stok tersedia, dan harga jual."""
     d = await api("item/list.do", {
@@ -107,7 +122,7 @@ async def cari_barang(kata_kunci: str, halaman: int = 1) -> str:
     return "\n".join(f"{r.get('no')} | {r.get('name')} | stok {r.get('availableToSell')} | Rp {r.get('unitPrice')} | {(r.get('itemCategory') or {}).get('name','')}" for r in rows) + f"\n(halaman {halaman}, total {d.get('sp',{}).get('rowCount','?')})"
 
 
-@mcp.tool()
+@tool({"batas": I("batas stok, default 10")})
 async def stok_menipis(batas: int = 10) -> str:
     """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10)."""
     d = await api("item/list.do", {
@@ -118,7 +133,7 @@ async def stok_menipis(batas: int = 10) -> str:
     return "\n".join(f"{r['no']} | {r['name']} | stok {r['availableToSell']}" for r in rows) or "Semua stok di atas batas."
 
 
-@mcp.tool()
+@tool({"kata_kunci": S("nama pelanggan (opsional)"), "halaman": I("halaman")})
 async def piutang_pelanggan(kata_kunci: str = "", halaman: int = 1) -> str:
     """Daftar faktur penjualan yang belum lunas (piutang), bisa difilter nama pelanggan."""
     p = {"fields": "number,transDate,dueDate,customer.name,totalAmount,outstanding,age",
@@ -134,7 +149,7 @@ async def piutang_pelanggan(kata_kunci: str = "", halaman: int = 1) -> str:
     return "\n".join(f"{r['number']} | {r.get('transDate')} jatuh tempo {r.get('dueDate')} | {(r.get('customer') or {}).get('name')} | sisa Rp {r.get('outstanding'):,.0f} | umur {r.get('age','?')} hari" for r in rows) + f"\nTotal di halaman ini: Rp {tot:,.0f}"
 
 
-@mcp.tool()
+@tool({"tanggal_awal": S("DD/MM/YYYY", True), "tanggal_akhir": S("DD/MM/YYYY", True), "halaman": I("halaman")})
 async def omset(tanggal_awal: str, tanggal_akhir: str, halaman: int = 1) -> str:
     """Rekap faktur penjualan dalam rentang tanggal (format DD/MM/YYYY). Kembalikan daftar faktur & total."""
     d = await api("sales-invoice/list.do", {
@@ -152,7 +167,7 @@ async def omset(tanggal_awal: str, tanggal_akhir: str, halaman: int = 1) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool({"kata_kunci": S("nama toko/bengkel", True)})
 async def cari_pelanggan(kata_kunci: str) -> str:
     """Cari toko/bengkel (pelanggan) di Accurate: nama, kota, kontak, sales penanggung jawab."""
     d = await api("customer/list.do", {
@@ -198,8 +213,58 @@ async def callback(code: str, state_: str = None, state: str = None):
 async def guard(request: Request, call_next):
     if MCP_TOKEN and request.url.path.startswith("/mcp"):
         if request.headers.get("authorization") != f"Bearer {MCP_TOKEN}":
-            raise HTTPException(401, "token salah")
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "token salah"}, status_code=401)
     return await call_next(request)
 
 
-app.mount("/mcp", mcp.streamable_http_app())
+from fastapi.responses import JSONResponse, Response
+
+
+@app.get("/mcp")
+def mcp_get():
+    return Response(status_code=405)
+
+
+@app.delete("/mcp")
+def mcp_delete():
+    return Response(status_code=200)
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    """MCP Streamable HTTP (stateless, balasan JSON)."""
+    body = await request.json()
+    msgs = body if isinstance(body, list) else [body]
+    out = []
+    for m in msgs:
+        mid, method, params = m.get("id"), m.get("method", ""), m.get("params") or {}
+        if method.startswith("notifications/"):
+            continue
+        try:
+            if method == "initialize":
+                res = {"protocolVersion": params.get("protocolVersion", "2025-03-26"), "capabilities": {"tools": {"listChanged": False}},
+                       "serverInfo": {"name": "Accurate Jaya Partindo", "version": "1.0"}}
+            elif method == "ping":
+                res = {}
+            elif method == "tools/list":
+                res = {"tools": [{"name": n, "description": t["description"], "inputSchema": t["inputSchema"]} for n, t in TOOLS.items()]}
+            elif method == "tools/call":
+                t = TOOLS.get(params.get("name"))
+                if not t:
+                    raise ValueError("tool tidak dikenal: " + str(params.get("name")))
+                args = {k: v for k, v in (params.get("arguments") or {}).items() if v is not None and v != ""}
+                try:
+                    text = await t["fn"](**args)
+                    res = {"content": [{"type": "text", "text": str(text)}], "isError": False}
+                except Exception as e:
+                    res = {"content": [{"type": "text", "text": f"Gagal: {e}"}], "isError": True}
+            else:
+                out.append({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method tidak dikenal: " + method}})
+                continue
+            out.append({"jsonrpc": "2.0", "id": mid, "result": res})
+        except Exception as e:
+            out.append({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": str(e)}})
+    if not out:
+        return Response(status_code=202)
+    return JSONResponse(out[0] if len(out) == 1 and not isinstance(body, list) else out)
