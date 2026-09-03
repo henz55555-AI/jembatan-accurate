@@ -30,6 +30,7 @@ DB_ID = os.environ.get("ACCURATE_DB_ID", "")
 ACC = "https://account.accurate.id"
 SCOPES = os.environ.get("ACCURATE_SCOPES", "item_view customer_view sales_invoice_view sales_order_view warehouse_view")
 TOK_FILE = "tokens.json"
+REQUIRE_OAUTH = os.environ.get("REQUIRE_OAUTH", "1") != "0"
 
 state = {"access": None, "refresh": os.environ.get("ACCURATE_REFRESH_TOKEN"), "exp": 0, "host": None, "session": None, "sess_exp": 0}
 if os.path.exists(TOK_FILE):
@@ -226,21 +227,107 @@ async def callback(request: Request):
         f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
 
 
+# ---------- OAuth sederhana untuk Claude (auto-approve) ----------
+# Claude mewajibkan connector kustom punya alur OAuth. Server ini menyediakannya
+# secara minimal: siapa pun yang buka /authorize langsung disetujui dan diberi
+# access token acak. Ini hanya "kunci pintu" ringan, bukan login per pengguna.
+oauth = {"clients": {}, "codes": {}, "tokens": set()}
+
+
 @app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/api")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def prm():
+    return {"resource": BASE_URL, "authorization_servers": [BASE_URL]}
+
+
 @app.get("/.well-known/oauth-authorization-server")
 @app.get("/.well-known/openid-configuration")
-def no_oauth():
-    """Server ini tidak pakai OAuth untuk Claude — cukup Bearer token statis (MCP_TOKEN)."""
+def asm():
+    return {
+        "issuer": BASE_URL,
+        "authorization_endpoint": f"{BASE_URL}/authorize",
+        "token_endpoint": f"{BASE_URL}/token",
+        "registration_endpoint": f"{BASE_URL}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+        "scopes_supported": ["mcp"],
+    }
+
+
+@app.post("/register")
+async def register(request: Request):
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    cid = "cl_" + secrets.token_hex(8)
+    oauth["clients"][cid] = body or {}
+    out = {"client_id": cid, "client_id_issued_at": int(time.time()),
+           "redirect_uris": body.get("redirect_uris", []),
+           "token_endpoint_auth_method": "none",
+           "grant_types": ["authorization_code", "refresh_token"],
+           "response_types": ["code"]}
+    if body.get("client_name"):
+        out["client_name"] = body["client_name"]
     from fastapi.responses import JSONResponse
-    return JSONResponse({"error": "no_oauth"}, status_code=404)
+    return JSONResponse(out, status_code=201)
+
+
+@app.get("/authorize")
+def authorize(request: Request):
+    q = dict(request.query_params)
+    redirect_uri = q.get("redirect_uri")
+    if not redirect_uri:
+        raise HTTPException(400, "redirect_uri wajib")
+    code = "cd_" + secrets.token_urlsafe(24)
+    oauth["codes"][code] = {"exp": time.time() + 600}
+    sep = "&" if "?" in redirect_uri else "?"
+    url = f"{redirect_uri}{sep}code={code}"
+    if q.get("state"):
+        url += "&state=" + urllib.parse.quote(q["state"])
+    return RedirectResponse(url)
+
+
+@app.post("/token")
+async def token_ep(request: Request):
+    form = {}
+    try:
+        form = dict(await request.form())
+    except Exception:
+        try:
+            form = await request.json()
+        except Exception:
+            pass
+    gt = form.get("grant_type")
+    if gt == "authorization_code":
+        c = form.get("code")
+        rec = oauth["codes"].pop(c, None)
+        if not rec or rec["exp"] < time.time():
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    elif gt != "refresh_token":
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    at = "at_" + secrets.token_urlsafe(32)
+    rt = "rt_" + secrets.token_urlsafe(32)
+    oauth["tokens"].add(at)
+    return {"access_token": at, "token_type": "Bearer", "expires_in": 2592000,
+            "refresh_token": rt, "scope": "mcp"}
 
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    if MCP_TOKEN and request.url.path.rstrip("/") in ("/mcp", "/api", "/jp"):
-        if request.headers.get("authorization") != f"Bearer {MCP_TOKEN}":
+    if request.url.path.rstrip("/") in ("/mcp", "/api", "/jp"):
+        auth = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
+        ok = auth in oauth["tokens"] or (MCP_TOKEN and auth == MCP_TOKEN) or (not MCP_TOKEN and not REQUIRE_OAUTH)
+        if not ok:
             from fastapi.responses import JSONResponse
-            return JSONResponse({"error": "token salah"}, status_code=401)
+            return JSONResponse({"error": "invalid_token"}, status_code=401,
+                                headers={"WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'})
     return await call_next(request)
 
 
