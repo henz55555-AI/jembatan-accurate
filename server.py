@@ -226,9 +226,18 @@ async def callback(request: Request):
         f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
 
 
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/openid-configuration")
+def no_oauth():
+    """Server ini tidak pakai OAuth untuk Claude — cukup Bearer token statis (MCP_TOKEN)."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"error": "no_oauth"}, status_code=404)
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    if MCP_TOKEN and request.url.path.startswith("/mcp"):
+    if MCP_TOKEN and request.url.path.rstrip("/") in ("/mcp", "/api", "/jp"):
         if request.headers.get("authorization") != f"Bearer {MCP_TOKEN}":
             from fastapi.responses import JSONResponse
             return JSONResponse({"error": "token salah"}, status_code=401)
@@ -239,16 +248,26 @@ from fastapi.responses import JSONResponse, Response
 
 
 @app.get("/mcp")
+@app.get("/mcp/")
+@app.get("/api")
+@app.get("/jp")
 def mcp_get():
     return Response(status_code=405)
 
 
 @app.delete("/mcp")
+@app.delete("/mcp/")
+@app.delete("/api")
+@app.delete("/jp")
 def mcp_delete():
     return Response(status_code=200)
 
 
 @app.post("/mcp")
+@app.post("/mcp/")
+@app.post("/api")
+@app.post("/api/")
+@app.post("/jp")
 async def mcp_post(request: Request):
     """MCP Streamable HTTP (stateless, balasan JSON)."""
     body = await request.json()
