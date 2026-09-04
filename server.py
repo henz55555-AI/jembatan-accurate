@@ -229,6 +229,25 @@ async def callback(request: Request):
         f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
 
 
+# ---------- Penerus AI untuk kantor 3D (biar bisa dibuka di luar Claude) ----------
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+@app.post("/ai")
+async def ai_proxy(request: Request):
+    """Teruskan permintaan chat agent ke Anthropic memakai API key milik Pak Hendrik."""
+    from fastapi.responses import JSONResponse
+    if not ANTHROPIC_KEY:
+        return JSONResponse({"error": {"message": "ANTHROPIC_API_KEY belum diisi di Railway Variables"}}, status_code=400)
+    body = await request.json()
+    body.pop("mcp_servers", None)
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.post("https://api.anthropic.com/v1/messages", json=body,
+                         headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+                                  "content-type": "application/json"})
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
 # ---------- REST sederhana untuk kantor 3D (dipanggil langsung dari browser) ----------
 @app.get("/data/{nama}")
 async def data_tool(nama: str, request: Request):
