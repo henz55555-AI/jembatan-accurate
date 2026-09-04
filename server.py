@@ -136,56 +136,68 @@ async def cari_barang(kata_kunci: str, halaman: int = 1) -> str:
 @tool({"batas": I("batas stok, default 10"), "kata_kunci": S("saring nama/kode barang (opsional)"), "maks_baris": I("maksimal baris hasil, default 60")})
 async def stok_menipis(batas: int = 10, kata_kunci: str = "", maks_baris: int = 60) -> str:
     """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10), termasuk yang habis (stok 0)."""
-    async def ambil(halaman, pakai_sort, field_stok):
-        p = {"fields": f"no,name,{field_stok},unitPrice,itemCategory.name", "sp.page": halaman, "sp.pageSize": 100}
-        if pakai_sort:
-            p["sp.sort"] = field_stok + "|asc"
+    percobaan = [
+        ("no,name,availableToSell", "availableToSell", "availableToSell|asc", 50),
+        ("no,name,availableToSell", "availableToSell", None, 50),
+        ("no,name,quantity", "quantity", "quantity|asc", 50),
+        ("no,name,quantity", "quantity", None, 50),
+        ("no,name,availableToSell,unitPrice,itemCategory.name", "availableToSell", None, 25),
+        (None, "availableToSell", None, 50),
+    ]
+    galat = []
+
+    async def ambil(fields, sort, size, halaman):
+        p = {"sp.page": halaman, "sp.pageSize": size}
+        if fields:
+            p["fields"] = fields
+        if sort:
+            p["sp.sort"] = sort
         if kata_kunci:
             p.update({"filter.keywords.op": "CONTAIN", "filter.keywords.val[0]": kata_kunci})
         return await api("item/list.do", p)
 
-    # cari kombinasi field + sort yang diterima Accurate
-    field_stok, pakai_sort, pertama = None, True, None
-    for f in ("availableToSell", "quantity"):
-        for srt in (True, False):
-            try:
-                pertama = await ambil(1, srt, f)
-                field_stok, pakai_sort = f, srt
-                break
-            except Exception:
-                continue
-        if field_stok:
+    dipakai = None
+    for fields, fstok, sort, size in percobaan:
+        try:
+            pertama = await ambil(fields, sort, size, 1)
+            dipakai = (fields, fstok, sort, size, pertama)
             break
-    if not field_stok:
-        return "Accurate menolak permintaan daftar barang. Coba tool cari_barang atau data_accurate?jenis=barang."
+        except Exception as e:
+            galat.append(str(e)[:120])
+    if not dipakai:
+        return "Accurate menolak semua cara baca daftar barang.\nPesan aslinya:\n- " + "\n- ".join(galat)
 
-    hasil, halaman, d = [], 1, pertama
+    fields, fstok, sort, size, d = dipakai
+    hasil, halaman = [], 1
     while halaman <= 12:
         rows = d.get("d", [])
         if not rows:
             break
         berhenti = False
         for r in rows:
+            nilai = r.get(fstok)
+            if nilai is None:
+                nilai = r.get("availableToSell", r.get("quantity"))
             try:
-                st = float(r.get(field_stok) or 0)
+                st = float(nilai or 0)
             except (TypeError, ValueError):
                 continue
             if st < batas:
                 hasil.append((st, r))
-            elif pakai_sort:
+            elif sort:
                 berhenti = True
         sp = d.get("sp", {})
         if berhenti or halaman >= (sp.get("pageCount") or 1):
             break
         halaman += 1
         try:
-            d = await ambil(halaman, pakai_sort, field_stok)
+            d = await ambil(fields, sort, size, halaman)
         except Exception:
             break
     if not hasil:
         return f"Tidak ada barang dengan stok di bawah {batas}."
     hasil.sort(key=lambda x: x[0])
-    baris = [f"{r.get('no')} | {r.get('name')} | stok {st:g} | Rp {r.get('unitPrice')} | {(r.get('itemCategory') or {}).get('name','')}"
+    baris = [f"{r.get('no')} | {r.get('name')} | stok {st:g}" + (f" | Rp {r.get('unitPrice')}" if r.get("unitPrice") else "")
              for st, r in hasil[:maks_baris]]
     ket = f"{len(hasil)} barang stoknya di bawah {batas}"
     if len(hasil) > maks_baris:
