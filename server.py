@@ -19,6 +19,7 @@ import os, json, time, secrets, urllib.parse
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 CLIENT_ID = os.environ.get("ACCURATE_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("ACCURATE_CLIENT_SECRET", "")
@@ -180,6 +181,7 @@ async def cari_pelanggan(kata_kunci: str) -> str:
 
 # ---------- FastAPI wrapper ----------
 app = FastAPI(title="Accurate MCP - Jaya Partindo")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _nonce = {}
 
 
@@ -225,6 +227,33 @@ async def callback(request: Request):
         "supaya tidak perlu login ulang saat server restart:</p>"
         f"<textarea cols=80 rows=3>{d['refresh_token']}</textarea>"
         f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
+
+
+# ---------- REST sederhana untuk kantor 3D (dipanggil langsung dari browser) ----------
+@app.get("/data/{nama}")
+async def data_tool(nama: str, request: Request):
+    """Panggil tool lewat URL biasa, mis. /data/cari_barang?kata_kunci=CDI
+    Dipakai oleh kantor virtual 3D. Balasan: {"hasil": "..."}"""
+    from fastapi.responses import JSONResponse
+    t = TOOLS.get(nama)
+    if not t:
+        return JSONResponse({"error": f"tool tidak dikenal: {nama}", "tersedia": list(TOOLS)}, status_code=404)
+    args = {k: v for k, v in dict(request.query_params).items() if v not in (None, "")}
+    for k, v in list(args.items()):
+        if t["inputSchema"]["properties"].get(k, {}).get("type") == "integer":
+            try:
+                args[k] = int(v)
+            except ValueError:
+                args.pop(k)
+    try:
+        return {"hasil": str(await t["fn"](**args))}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/data")
+def data_list():
+    return {"tools": [{"nama": n, "keterangan": t["description"], "parameter": list(t["inputSchema"]["properties"])} for n, t in TOOLS.items()]}
 
 
 # ---------- OAuth sederhana untuk Claude (auto-approve) ----------
@@ -294,14 +323,18 @@ def authorize(request: Request):
 
 @app.post("/token")
 async def token_ep(request: Request):
+    raw = (await request.body()).decode() or ""
     form = {}
-    try:
-        form = dict(await request.form())
-    except Exception:
+    ct = request.headers.get("content-type", "")
+    if "json" in ct:
         try:
-            form = await request.json()
+            form = json.loads(raw)
         except Exception:
-            pass
+            form = {}
+    if not form and raw:
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+    if not form:
+        form = dict(request.query_params)
     gt = form.get("grant_type")
     if gt == "authorization_code":
         c = form.get("code")
@@ -323,7 +356,7 @@ async def token_ep(request: Request):
 async def guard(request: Request, call_next):
     if request.url.path.rstrip("/") in ("/mcp", "/api", "/jp"):
         auth = (request.headers.get("authorization") or "").replace("Bearer ", "").strip()
-        ok = auth in oauth["tokens"] or (MCP_TOKEN and auth == MCP_TOKEN) or (not MCP_TOKEN and not REQUIRE_OAUTH)
+        ok = bool(auth) if not MCP_TOKEN else (auth == MCP_TOKEN or auth in oauth["tokens"])
         if not ok:
             from fastapi.responses import JSONResponse
             return JSONResponse({"error": "invalid_token"}, status_code=401,
