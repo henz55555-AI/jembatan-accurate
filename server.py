@@ -124,15 +124,47 @@ async def cari_barang(kata_kunci: str, halaman: int = 1) -> str:
     return "\n".join(f"{r.get('no')} | {r.get('name')} | stok {r.get('availableToSell')} | Rp {r.get('unitPrice')} | {(r.get('itemCategory') or {}).get('name','')}" for r in rows) + f"\n(halaman {halaman}, total {d.get('sp',{}).get('rowCount','?')})"
 
 
-@tool({"batas": I("batas stok, default 10")})
-async def stok_menipis(batas: int = 10) -> str:
-    """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10)."""
-    d = await api("item/list.do", {
-        "fields": "no,name,availableToSell",
-        "filter.availableToSell.op": "LESS_THAN", "filter.availableToSell.val[0]": batas,
-        "filter.suspended": "false", "sp.pageSize": 100, "sp.sort": "availableToSell|asc"})
-    rows = d.get("d", [])
-    return "\n".join(f"{r['no']} | {r['name']} | stok {r['availableToSell']}" for r in rows) or "Semua stok di atas batas."
+@tool({"batas": I("batas stok, default 10"), "kata_kunci": S("saring nama/kode barang (opsional)"), "maks_baris": I("maksimal baris hasil, default 60")})
+async def stok_menipis(batas: int = 10, kata_kunci: str = "", maks_baris: int = 60) -> str:
+    """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10), termasuk yang stoknya 0/habis."""
+    hasil, halaman = [], 1
+    while halaman <= 12:
+        p = {"fields": "no,name,availableToSell,quantity,unitPrice,itemCategory.name",
+             "sp.page": halaman, "sp.pageSize": 100, "sp.sort": "availableToSell|asc"}
+        if kata_kunci:
+            p.update({"filter.keywords.op": "CONTAIN", "filter.keywords.val[0]": kata_kunci})
+        try:
+            d = await api("item/list.do", p)
+        except Exception as e:
+            if halaman == 1:
+                raise
+            break
+        rows = d.get("d", [])
+        if not rows:
+            break
+        habis = False
+        for r in rows:
+            try:
+                st = float(r.get("availableToSell") or 0)
+            except (TypeError, ValueError):
+                continue
+            if st < batas:
+                hasil.append((st, r))
+            else:
+                habis = True
+        sp = d.get("sp", {})
+        if habis or halaman >= (sp.get("pageCount") or 1):
+            break
+        halaman += 1
+    if not hasil:
+        return f"Tidak ada barang dengan stok di bawah {batas}."
+    hasil.sort(key=lambda x: x[0])
+    baris = [f"{r.get('no')} | {r.get('name')} | stok {st:g} | Rp {r.get('unitPrice')} | {(r.get('itemCategory') or {}).get('name','')}"
+             for st, r in hasil[:maks_baris]]
+    ket = f"{len(hasil)} barang stoknya di bawah {batas}"
+    if len(hasil) > maks_baris:
+        ket += f" (ditampilkan {maks_baris} teratas)"
+    return ket + ":\n" + "\n".join(baris)
 
 
 @tool({"kata_kunci": S("nama pelanggan (opsional)"), "halaman": I("halaman")})
