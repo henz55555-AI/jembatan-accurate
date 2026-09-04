@@ -29,7 +29,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 DB_ID = os.environ.get("ACCURATE_DB_ID", "")
 ACC = "https://account.accurate.id"
-SCOPES = os.environ.get("ACCURATE_SCOPES", "item_view customer_view sales_invoice_view sales_order_view warehouse_view")
+SCOPES = os.environ.get("ACCURATE_SCOPES", "item_view customer_view sales_invoice_view sales_order_view warehouse_view vendor_view purchase_invoice_view purchase_order_view sales_receipt_view delivery_order_view sales_return_view item_adjustment_view item_transfer_view employee_view glaccount_view project_view department_view receive_item_view sales_quotation_view")
 TOK_FILE = "tokens.json"
 REQUIRE_OAUTH = os.environ.get("REQUIRE_OAUTH", "1") != "0"
 
@@ -227,6 +227,120 @@ async def callback(request: Request):
         "supaya tidak perlu login ulang saat server restart:</p>"
         f"<textarea cols=80 rows=3>{d['refresh_token']}</textarea>"
         f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
+
+
+@tool({"jenis": S("jenis data, lihat daftar di keterangan", True), "kata_kunci": S("filter kata kunci (opsional)"),
+       "tanggal_awal": S("DD/MM/YYYY (opsional, untuk data transaksi)"), "tanggal_akhir": S("DD/MM/YYYY (opsional)"),
+       "halaman": I("halaman, mulai 1"), "urut": S("nama field + |asc atau |desc, mis. transDate|desc")})
+async def data_accurate(jenis: str, kata_kunci: str = "", tanggal_awal: str = "", tanggal_akhir: str = "",
+                        halaman: int = 1, urut: str = "") -> str:
+    """Baca data apa pun dari Accurate Online. Isi 'jenis' dengan salah satu:
+    barang, kategori-barang, stok-gudang, gudang, pelanggan, supplier, sales-order, faktur-penjualan,
+    pengiriman, retur-penjualan, penerimaan-pembayaran, purchase-order, faktur-pembelian, penerimaan-barang,
+    penawaran, karyawan, sales, akun, proyek, departemen, mutasi-barang, penyesuaian-stok.
+    Bisa difilter kata_kunci dan rentang tanggal. Gunakan ini untuk data yang tidak dicakup tool lain."""
+    peta = {
+        "barang": ("item/list.do", "no,name,availableToSell,quantity,unitPrice,vendorPrice,itemCategory.name,itemType"),
+        "kategori-barang": ("item-category/list.do", "id,name,parent.name"),
+        "stok-gudang": ("item/list-stock.do", "no,name,warehouse.name,quantity,availableToSell"),
+        "gudang": ("warehouse/list.do", "id,name,description,street,pic"),
+        "pelanggan": ("customer/list.do", "customerNo,name,mobilePhone,whatsappNo,email,billCity,billStreet,customerType.name,salesman.name,balance,creditLimit"),
+        "supplier": ("vendor/list.do", "vendorNo,name,mobilePhone,email,billCity,balance"),
+        "sales-order": ("sales-order/list.do", "number,transDate,customer.name,totalAmount,statusName,salesman.name"),
+        "faktur-penjualan": ("sales-invoice/list.do", "number,transDate,dueDate,customer.name,totalAmount,outstanding,age,salesman.name,statusName"),
+        "pengiriman": ("delivery-order/list.do", "number,transDate,customer.name,statusName"),
+        "retur-penjualan": ("sales-return/list.do", "number,transDate,customer.name,totalAmount"),
+        "penerimaan-pembayaran": ("sales-receipt/list.do", "number,transDate,customer.name,chequeAmount"),
+        "purchase-order": ("purchase-order/list.do", "number,transDate,vendor.name,totalAmount,statusName"),
+        "faktur-pembelian": ("purchase-invoice/list.do", "number,transDate,dueDate,vendor.name,totalAmount,outstanding"),
+        "penerimaan-barang": ("receive-item/list.do", "number,transDate,vendor.name"),
+        "penawaran": ("sales-quotation/list.do", "number,transDate,customer.name,totalAmount,statusName"),
+        "karyawan": ("employee/list.do", "number,name,email,mobilePhone"),
+        "sales": ("salesman/list.do", "salesmanNo,name,email,mobilePhone"),
+        "akun": ("glaccount/list.do", "no,name,accountType,balance"),
+        "proyek": ("project/list.do", "no,name,customer.name"),
+        "departemen": ("department/list.do", "no,name"),
+        "mutasi-barang": ("item-transfer/list.do", "number,transDate,fromWarehouse.name,toWarehouse.name"),
+        "penyesuaian-stok": ("item-adjustment/list.do", "number,transDate,warehouse.name,description"),
+    }
+    j = jenis.strip().lower()
+    if j not in peta:
+        return "Jenis tidak dikenal. Pilihan: " + ", ".join(peta)
+    path, fields = peta[j]
+    p = {"fields": fields, "sp.page": halaman, "sp.pageSize": 50}
+    if kata_kunci:
+        p.update({"filter.keywords.op": "CONTAIN", "filter.keywords.val[0]": kata_kunci})
+    if tanggal_awal and tanggal_akhir:
+        p.update({"filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": tanggal_awal, "filter.transDate.val[1]": tanggal_akhir})
+    if urut:
+        p["sp.sort"] = urut
+    d = await api(path, p)
+    rows = d.get("d", [])
+    if not rows:
+        return f"Tidak ada data {j} yang cocok."
+
+    def datar(o, prefix=""):
+        out = {}
+        for k, v in (o or {}).items():
+            if isinstance(v, dict):
+                out.update(datar(v, prefix + k + "."))
+            elif not isinstance(v, list):
+                out[prefix + k] = v
+        return out
+
+    baris = []
+    for r in rows:
+        f = datar(r)
+        baris.append(" | ".join(f"{k}={v}" for k, v in f.items() if v not in (None, "", 0) and k != "id"))
+    sp = d.get("sp", {})
+    return f"[{j}] {len(rows)} baris (halaman {halaman} dari {sp.get('pageCount','?')}, total {sp.get('rowCount','?')})\n" + "\n".join(baris)
+
+
+@tool({"kode_atau_nama": S("kode atau nama barang", True)})
+async def detail_barang(kode_atau_nama: str) -> str:
+    """Detail lengkap satu barang: stok per gudang, harga jual, harga beli, satuan, kategori."""
+    d = await api("item/list.do", {
+        "fields": "id,no,name,availableToSell,quantity,unitPrice,vendorPrice,unit1Name,itemCategory.name,notes,detailOpenBalance",
+        "filter.keywords.op": "CONTAIN", "filter.keywords.val[0]": kode_atau_nama, "sp.pageSize": 5})
+    rows = d.get("d", [])
+    if not rows:
+        return "Barang tidak ditemukan."
+    out = []
+    for r in rows:
+        out.append(f"{r.get('no')} | {r.get('name')} | stok total {r.get('quantity')} | siap jual {r.get('availableToSell')} | jual Rp {r.get('unitPrice')} | beli Rp {r.get('vendorPrice')} | satuan {r.get('unit1Name')} | kategori {(r.get('itemCategory') or {}).get('name','-')}")
+        try:
+            g = await api("item/list-stock.do", {"fields": "warehouse.name,quantity", "filter.itemId.op": "EQUAL", "filter.itemId.val[0]": r.get("id"), "sp.pageSize": 30})
+            for w in g.get("d", []):
+                out.append(f"   gudang {(w.get('warehouse') or {}).get('name')}: {w.get('quantity')}")
+        except Exception:
+            pass
+    return "\n".join(out)
+
+
+@tool({"tanggal_awal": S("DD/MM/YYYY", True), "tanggal_akhir": S("DD/MM/YYYY", True), "top": I("berapa barang teratas, default 15")})
+async def barang_terlaris(tanggal_awal: str, tanggal_akhir: str, top: int = 15) -> str:
+    """Barang paling laku dalam rentang tanggal, dihitung dari detail faktur penjualan."""
+    rekap = {}
+    for hal in range(1, 6):
+        d = await api("sales-invoice/list.do", {
+            "fields": "number,detailItem.item.no,detailItem.item.name,detailItem.quantity,detailItem.totalPrice",
+            "filter.transDate.op": "BETWEEN", "filter.transDate.val[0]": tanggal_awal, "filter.transDate.val[1]": tanggal_akhir,
+            "sp.page": hal, "sp.pageSize": 100})
+        rows = d.get("d", [])
+        for r in rows:
+            for it in (r.get("detailItem") or []):
+                item = (it.get("item") or {})
+                k = f"{item.get('no','?')} {item.get('name','?')}"
+                a = rekap.setdefault(k, [0, 0])
+                a[0] += float(it.get("quantity") or 0)
+                a[1] += float(it.get("totalPrice") or 0)
+        if hal >= (d.get("sp", {}).get("pageCount") or 1):
+            break
+    if not rekap:
+        return "Tidak ada data penjualan pada periode itu (atau detail item tidak tersedia)."
+    urut = sorted(rekap.items(), key=lambda x: -x[1][1])[:top]
+    return f"Barang terlaris {tanggal_awal} s/d {tanggal_akhir}:\n" + "\n".join(
+        f"{i+1}. {k} — {v[0]:,.0f} pcs — Rp {v[1]:,.0f}" for i, (k, v) in enumerate(urut))
 
 
 # ---------- Penerus AI untuk kantor 3D (biar bisa dibuka di luar Claude) ----------
