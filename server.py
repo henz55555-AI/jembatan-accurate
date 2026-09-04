@@ -30,16 +30,24 @@ MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 DB_ID = os.environ.get("ACCURATE_DB_ID", "")
 ACC = "https://account.accurate.id"
 SCOPES = os.environ.get("ACCURATE_SCOPES", "item_view customer_view sales_invoice_view sales_order_view warehouse_view vendor_view purchase_invoice_view purchase_order_view sales_receipt_view delivery_order_view sales_return_view item_adjustment_view item_transfer_view employee_view glaccount_view project_view department_view receive_item_view sales_quotation_view")
-TOK_FILE = "tokens.json"
+TOK_FILE = os.environ.get("TOKEN_FILE", "/data/tokens.json" if os.path.isdir("/data") else "tokens.json")
 REQUIRE_OAUTH = os.environ.get("REQUIRE_OAUTH", "1") != "0"
 
 state = {"access": None, "refresh": os.environ.get("ACCURATE_REFRESH_TOKEN"), "exp": 0, "host": None, "session": None, "sess_exp": 0}
 if os.path.exists(TOK_FILE):
-    state.update(json.load(open(TOK_FILE)))
+    try:
+        state.update({k: v for k, v in json.load(open(TOK_FILE)).items() if v})
+        print("Token dimuat dari", TOK_FILE)
+    except Exception as e:
+        print("Token gagal dimuat:", e)
 
 
 def save():
-    json.dump({k: state[k] for k in ("access", "refresh", "exp")}, open(TOK_FILE, "w"))
+    try:
+        os.makedirs(os.path.dirname(TOK_FILE) or ".", exist_ok=True)
+        json.dump({k: state[k] for k in ("access", "refresh", "exp")}, open(TOK_FILE, "w"))
+    except Exception as e:
+        print("PERINGATAN: token gagal disimpan:", e)
 
 
 # ---------- OAuth ----------
@@ -49,7 +57,8 @@ async def refresh_access():
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{ACC}/oauth/token", data={"grant_type": "refresh_token", "refresh_token": state["refresh"]},
                          auth=(CLIENT_ID, CLIENT_SECRET))
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError("Token Accurate sudah tidak berlaku. Buka " + BASE_URL + "/auth di browser untuk login ulang sekali.")
     d = r.json()
     state.update(access=d["access_token"], refresh=d.get("refresh_token", state["refresh"]), exp=time.time() + d.get("expires_in", 3600) - 60)
     save()
@@ -126,36 +135,53 @@ async def cari_barang(kata_kunci: str, halaman: int = 1) -> str:
 
 @tool({"batas": I("batas stok, default 10"), "kata_kunci": S("saring nama/kode barang (opsional)"), "maks_baris": I("maksimal baris hasil, default 60")})
 async def stok_menipis(batas: int = 10, kata_kunci: str = "", maks_baris: int = 60) -> str:
-    """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10), termasuk yang stoknya 0/habis."""
-    hasil, halaman = [], 1
-    while halaman <= 12:
-        p = {"fields": "no,name,availableToSell,quantity,unitPrice,itemCategory.name",
-             "sp.page": halaman, "sp.pageSize": 100, "sp.sort": "availableToSell|asc"}
+    """Daftar barang yang stok tersedianya di bawah batas tertentu (default 10), termasuk yang habis (stok 0)."""
+    async def ambil(halaman, pakai_sort, field_stok):
+        p = {"fields": f"no,name,{field_stok},unitPrice,itemCategory.name", "sp.page": halaman, "sp.pageSize": 100}
+        if pakai_sort:
+            p["sp.sort"] = field_stok + "|asc"
         if kata_kunci:
             p.update({"filter.keywords.op": "CONTAIN", "filter.keywords.val[0]": kata_kunci})
-        try:
-            d = await api("item/list.do", p)
-        except Exception as e:
-            if halaman == 1:
-                raise
+        return await api("item/list.do", p)
+
+    # cari kombinasi field + sort yang diterima Accurate
+    field_stok, pakai_sort, pertama = None, True, None
+    for f in ("availableToSell", "quantity"):
+        for srt in (True, False):
+            try:
+                pertama = await ambil(1, srt, f)
+                field_stok, pakai_sort = f, srt
+                break
+            except Exception:
+                continue
+        if field_stok:
             break
+    if not field_stok:
+        return "Accurate menolak permintaan daftar barang. Coba tool cari_barang atau data_accurate?jenis=barang."
+
+    hasil, halaman, d = [], 1, pertama
+    while halaman <= 12:
         rows = d.get("d", [])
         if not rows:
             break
-        habis = False
+        berhenti = False
         for r in rows:
             try:
-                st = float(r.get("availableToSell") or 0)
+                st = float(r.get(field_stok) or 0)
             except (TypeError, ValueError):
                 continue
             if st < batas:
                 hasil.append((st, r))
-            else:
-                habis = True
+            elif pakai_sort:
+                berhenti = True
         sp = d.get("sp", {})
-        if habis or halaman >= (sp.get("pageCount") or 1):
+        if berhenti or halaman >= (sp.get("pageCount") or 1):
             break
         halaman += 1
+        try:
+            d = await ambil(halaman, pakai_sort, field_stok)
+        except Exception:
+            break
     if not hasil:
         return f"Tidak ada barang dengan stok di bawah {batas}."
     hasil.sort(key=lambda x: x[0])
@@ -163,7 +189,7 @@ async def stok_menipis(batas: int = 10, kata_kunci: str = "", maks_baris: int = 
              for st, r in hasil[:maks_baris]]
     ket = f"{len(hasil)} barang stoknya di bawah {batas}"
     if len(hasil) > maks_baris:
-        ket += f" (ditampilkan {maks_baris} teratas)"
+        ket += f" (ditampilkan {maks_baris} paling sedikit)"
     return ket + ":\n" + "\n".join(baris)
 
 
@@ -220,7 +246,13 @@ _nonce = {}
 @app.get("/")
 def home():
     ok = bool(state["refresh"])
-    return HTMLResponse(f"<h3>Accurate MCP Jaya Partindo</h3><p>Status login: {'✅ sudah' if ok else '❌ belum'} — <a href='/auth'>Login Accurate</a></p><p>URL untuk Claude: <code>{BASE_URL}/mcp</code></p>")
+    awet = os.path.isdir(os.path.dirname(TOK_FILE) or ".") and TOK_FILE.startswith("/data")
+    return HTMLResponse(
+        f"<h3>Accurate MCP Jaya Partindo</h3>"
+        f"<p>Status login: {'✅ sudah' if ok else '❌ belum'} — <a href='/auth'>Login Accurate</a></p>"
+        f"<p>Penyimpanan token: {'✅ permanen (' + TOK_FILE + ')' if awet else '⚠️ sementara — token hilang tiap restart. Tambahkan Volume di Railway dengan mount path /data'}</p>"
+        f"<p>URL untuk kantor 3D: <code>{BASE_URL}</code> · URL untuk Claude: <code>{BASE_URL}/api</code></p>"
+        f"<p>Cek data: <a href='/data'>/data</a></p>")
 
 
 @app.get("/auth")
@@ -253,12 +285,14 @@ async def callback(request: Request):
     d = r.json()
     state.update(access=d["access_token"], refresh=d["refresh_token"], exp=time.time() + d.get("expires_in", 3600) - 60)
     save()
-    return HTMLResponse(
-        "<h3>✅ Accurate tersambung.</h3>"
-        "<p>Simpan refresh token ini ke Variables Railway sebagai <code>ACCURATE_REFRESH_TOKEN</code> "
-        "supaya tidak perlu login ulang saat server restart:</p>"
-        f"<textarea cols=80 rows=3>{d['refresh_token']}</textarea>"
-        f"<p>Lalu tambahkan <code>{BASE_URL}/mcp</code> ke Claude → Settings → Connectors.</p>")
+    awet = TOK_FILE.startswith("/data") and os.path.isdir("/data")
+    pesan = ("<p>✅ Token tersimpan permanen — tidak perlu login ulang walau server restart.</p>" if awet else
+             "<p>⚠️ Token hanya tersimpan sementara. Supaya tidak perlu login ulang tiap restart, "
+             "tambahkan <b>Volume</b> di Railway (Service → + → Volume) dengan mount path <code>/data</code>.</p>"
+             f"<p>Sementara itu, simpan token ini ke Variables <code>ACCURATE_REFRESH_TOKEN</code>:</p>"
+             f"<textarea cols=80 rows=3>{d['refresh_token']}</textarea>")
+    return HTMLResponse("<h3>✅ Accurate tersambung.</h3>" + pesan +
+                        f"<p><a href='/data/stok_menipis?batas=5'>Coba baca data →</a></p>")
 
 
 @tool({"jenis": S("jenis data, lihat daftar di keterangan", True), "kata_kunci": S("filter kata kunci (opsional)"),
